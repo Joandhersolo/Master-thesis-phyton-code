@@ -1,8 +1,7 @@
 """
 plot_cooking_from_SAS.py
 ========================
-Cooking behaviour of soaked WHOLE cowpea seeds – figures made directly from
-your SAS output.
+Cooking behaviour of soaked WHOLE cowpea seeds – figures made directly from SAS output in the excel file.
 
 Input files (keep them in the same folder as this script):
   1. RELATIVE_cooking_kinetics_output_soaked_cowpeas_oct_2026_1.xlsx
