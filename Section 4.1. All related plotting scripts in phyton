@@ -1,0 +1,307 @@
+"""
+make_section41_figures.py
+=========================
+Reproduces the five thesis figures of Section 4.1 (cooking behaviour of whole
+cowpea seeds) and Table 4.1, in the final thesis style, using ONLY the master
+data file. Nothing else is needed.
+
+    Fig 4.1  Relative hardness vs cooking time + fractional conversion model
+    Fig 4.2  95% joint confidence regions of k and RHf
+    Fig 4.3  % cooked seeds + logistic model, CT95 marked
+    Fig 4.4  CT95 per variety, 95% Fieller CI and group letters
+    Fig 4.5  k vs CT95 (variety means ± 95% CI, Pearson r)
+    Table 4.1 (CSV)
+
+Run on your own PC
+------------------
+1. Install Anaconda (includes all packages), or:  pip install numpy pandas scipy matplotlib openpyxl
+2. Put this script and "Jo_Cowpea_master_data_file - DM 4 peaks.xlsx" in one folder.
+3. Open the script in Spyder and press Run (F5), or in a terminal in that folder:
+       python make_section41_figures.py
+4. The figures (PNG, 300 dpi) appear in the folder "Section 4.1 figures".
+
+Varieties appear in order of CT95 (shortest -> longest) in every figure.
+"""
+
+from itertools import combinations
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from scipy import stats
+from scipy.optimize import curve_fit, minimize
+
+# =============================================================================
+# 0. Settings
+# =============================================================================
+DATA_FILE = "Jo_Cowpea_master_data_file - DM 4 peaks.xlsx"
+OUT = Path("Section 4.1 figures")
+OUT.mkdir(exist_ok=True)
+
+VARIETIES = ["Kat Kunde", "Kunde Soko", "Katumani 80", "Kunde Tamu", "Machakos 66", "KVU-27-1"]  # CT95 order
+COL = dict(zip(VARIETIES, ["#1a4f8b", "#a8241c", "#1d6b37", "#b85000", "#5e2a84", "#b0306e"]))
+MK = dict(zip(VARIETIES, ["o", "s", "^", "D", "v", "P"]))
+LS = {"Kat Kunde": (0, (6, 2)), "Kunde Soko": "-", "Katumani 80": "-",
+      "Kunde Tamu": (0, (1.5, 1.5)), "Machakos 66": "-", "KVU-27-1": (0, (6, 2))}
+
+plt.rcParams.update({
+    "font.family": "serif", "font.serif": ["Times New Roman", "Liberation Serif", "DejaVu Serif"],
+    "font.size": 14, "axes.linewidth": 1.2, "axes.spines.top": False, "axes.spines.right": False,
+    "axes.labelweight": "bold", "savefig.dpi": 300,
+})
+
+
+def save(fig, name):
+    fig.savefig(OUT / name, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    print("saved", name)
+
+
+# =============================================================================
+# 1. Read the raw data
+# =============================================================================
+hard = pd.read_excel(DATA_FILE, sheet_name="Raw_hardness", skiprows=3)
+hard.columns = ["variety", "seed", "time", "H", "RH"]
+hard = hard.dropna(subset=["variety", "time", "RH"])
+
+cook = pd.read_excel(DATA_FILE, sheet_name="Raw_cooked_fraction", skiprows=3).iloc[:, :4]
+cook.columns = ["variety", "time", "n_total", "n_cooked"]
+cook = cook[cook["variety"].isin(VARIETIES)].astype({"time": float, "n_total": float, "n_cooked": float})
+
+
+# =============================================================================
+# 2. Fractional conversion model: RH(t) = RHf + (1 - RHf) exp(-k t)
+# =============================================================================
+def frac_conv(t, k, RHf):
+    return RHf + (1 - RHf) * np.exp(-k * t)
+
+
+KIN = {}
+# %%
+for v in VARIETIES:
+
+    d = hard[hard["variety"] == v]
+    t, y = d["time"].to_numpy(float), d["RH"].to_numpy(float)
+    (k, RHf), cov = curve_fit(frac_conv, t, y, p0=[0.03, 0.3])
+    se = np.sqrt(np.diag(cov))
+    n = len(y)
+    sse = float(np.sum((y - frac_conv(t, k, RHf)) ** 2))
+    tcrit = stats.t.ppf(0.975, n - 2)
+    KIN[v] = dict(k=k, se_k=se[0], k_lo=k - tcrit * se[0], k_hi=k + tcrit * se[0],
+                  RHf=RHf, se_RHf=se[1], sse=sse, n=n, t=t, y=y,
+                  R2=1 - sse / np.sum((y - y.mean()) ** 2))
+
+
+# =============================================================================
+# 3. Logistic model of cooked seeds: p(t) = 1 / (1 + exp(-(a + b t)))
+#    Binomial maximum likelihood; CT95 = (ln19 - a)/b; 95% CI by Fieller
+# =============================================================================
+L95 = np.log(19)
+
+
+def fit_logistic(t, k, n):
+    def nll(par):
+        p = np.clip(1 / (1 + np.exp(-(par[0] + par[1] * t))), 1e-12, 1 - 1e-12)
+        return -np.sum(k * np.log(p) + (n - k) * np.log(1 - p))
+    a, b = minimize(nll, [-4, 0.08], method="Nelder-Mead",
+                    options=dict(xatol=1e-10, fatol=1e-10, maxiter=20000)).x
+    p = 1 / (1 + np.exp(-(a + b * t)))
+    X = np.column_stack([np.ones_like(t), t])
+    cov = np.linalg.inv(X.T @ ((n * p * (1 - p))[:, None] * X))
+    return a, b, cov
+
+
+def fieller(a, b, cov, level=L95, z=1.96):
+    A = b ** 2 - z ** 2 * cov[1, 1]
+    B = -2 * (b * (level - a) + z ** 2 * cov[0, 1])
+    C = (level - a) ** 2 - z ** 2 * cov[0, 0]
+    return np.sort(np.roots([A, B, C]).real)
+
+
+LOG = {}
+for v in VARIETIES:
+    d = cook[cook["variety"] == v]
+    t = d["time"].to_numpy()
+    a, b, cov = fit_logistic(t, d["n_cooked"].to_numpy(), d["n_total"].to_numpy())
+    ct95 = (L95 - a) / b
+    lo, hi = fieller(a, b, cov)
+    grad = np.array([-1 / b, -(L95 - a) / b ** 2])          # delta-method SE of CT95
+    LOG[v] = dict(a=a, b=b, CT50=-a / b, CT95=ct95, lo=lo, hi=hi,
+                  se=float(np.sqrt(grad @ cov @ grad)), t=t,
+                  pct=100 * d["n_cooked"].to_numpy() / d["n_total"].to_numpy())
+
+
+# Group letters for CT95: pairwise z-tests (delta-method SE), Bonferroni-adjusted
+def letters_ct95(alpha=0.05):
+    pairs = list(combinations(VARIETIES, 2))
+    sig = {}
+    for a, b in pairs:
+        z = abs(LOG[a]["CT95"] - LOG[b]["CT95"]) / np.hypot(LOG[a]["se"], LOG[b]["se"])
+        sig[(a, b)] = sig[(b, a)] = 2 * stats.norm.sf(z) * len(pairs) < alpha
+    groups = [set(VARIETIES)]                                # insert-absorb algorithm
+    for a, b in pairs:
+        if sig[(a, b)]:
+            new = []
+            for g in groups:
+                new += [g - {a}, g - {b}] if (a in g and b in g) else [g]
+            new = [g for g in new if not any(g < h for h in new)]
+            groups = [g for i, g in enumerate(new) if g not in new[:i]]
+    groups.sort(key=lambda g: min(VARIETIES.index(v) for v in g))
+    return {v: "".join("abcdefg"[i] for i, g in enumerate(groups) if v in g) for v in VARIETIES}
+
+
+LET = letters_ct95()
+
+# =============================================================================
+# 4. Table 4.1
+# =============================================================================
+table = pd.DataFrame([{
+    "Variety": v, "n seeds": KIN[v]["n"],
+    "k ± SE (1/min)": f'{KIN[v]["k"]:.4f} ± {KIN[v]["se_k"]:.4f}',
+    "RHf ± SE (-)": f'{KIN[v]["RHf"]:.3f} ± {KIN[v]["se_RHf"]:.3f}',
+    "R2": round(KIN[v]["R2"], 2),
+    "CT50 (min)": round(LOG[v]["CT50"], 1),
+    "CT95 (min) [95% CI]": f'{LOG[v]["CT95"]:.1f} [{LOG[v]["lo"]:.1f}–{LOG[v]["hi"]:.1f}]',
+    "CT95 group": LET[v]} for v in VARIETIES])
+table.to_csv(OUT / "Table 4.1 - kinetic and cooking-time parameters.csv", index=False, encoding="utf-8-sig")
+print(table.to_string(index=False))
+
+# =============================================================================
+# 5. Fig 4.1 – relative hardness vs cooking time
+# =============================================================================
+fig, ax = plt.subplots(figsize=(10.5, 6.6))
+offset = dict(zip(VARIETIES, np.linspace(-2.5, 2.5, 6)))       # small shift so error bars do not overlap
+for v in VARIETIES:
+    d = hard[hard["variety"] == v]
+    g = d.groupby("time")["RH"].agg(["mean", "std"])
+    ax.errorbar(g.index + offset[v], g["mean"], yerr=g["std"], fmt=MK[v], ms=6.5, color=COL[v],
+                mfc="white", mew=1.6, capsize=2.5, lw=1, zorder=3)
+    tt = np.linspace(0, d["time"].max(), 300)
+    ax.plot(tt, frac_conv(tt, KIN[v]["k"], KIN[v]["RHf"]), color=COL[v], lw=2.6, ls=LS[v], zorder=4)
+handles = [Line2D([0], [0], color=COL[v], lw=2.6, ls=LS[v], marker=MK[v], mfc="white", mew=1.6, ms=7)
+           for v in VARIETIES]
+labels = [f'{v}: k = {KIN[v]["k"]:.4f} min$^{{-1}}$, RH$_f$ = {KIN[v]["RHf"]:.2f}, R$^2$ = {KIN[v]["R2"]:.2f}'
+          for v in VARIETIES]
+leg = ax.legend(handles, labels, frameon=False, fontsize=11.5, loc="upper right", handlelength=3.4)
+for txt, v in zip(leg.get_texts(), VARIETIES):
+    txt.set_color(COL[v])
+ax.text(0.02, 0.04, "Lines: RH(t) = RH$_f$ + (1 − RH$_f$)·exp(−k·t), fractional conversion model\n"
+        "Points: mean ± SD (n = 20 soaked whole seeds per time point)",
+        transform=ax.transAxes, fontsize=11.5, color="#444")
+ax.set_xlabel("Cooking time at 95 °C (min)")
+ax.set_ylabel("Relative hardness, H/H$_0$ (–)")
+ax.set_xlim(-5, 172)
+ax.set_ylim(0, 1.2)
+save(fig, "Fig 4.1 - relative hardness whole seeds.png")
+
+# =============================================================================
+# 6. Fig 4.2 – 95% joint confidence regions of k and RHf
+# =============================================================================
+fig, ax = plt.subplots(figsize=(9, 6.6))
+ax.grid(True, color="#E9E9E9", lw=0.8)
+ax.set_axisbelow(True)
+for v in VARIETIES:
+    K = KIN[v]
+    t, y, n = K["t"], K["y"], K["n"]
+    limit = K["sse"] * (1 + 2 / (n - 2) * stats.f.ppf(0.95, 2, n - 2))
+    ks = np.linspace(K["k"] - 6 * K["se_k"], K["k"] + 6 * K["se_k"], 220)
+    rs = np.linspace(K["RHf"] - 6 * K["se_RHf"], K["RHf"] + 6 * K["se_RHf"], 220)
+    KK, RR = np.meshgrid(ks, rs)
+    SSE = ((y[None, None, :] - frac_conv(t[None, None, :], KK[..., None], RR[..., None])) ** 2).sum(-1)
+    ax.contourf(KK, RR, SSE, levels=[0, limit], colors=[COL[v]], alpha=0.12)
+    ax.contour(KK, RR, SSE, levels=[limit], colors=[COL[v]], linewidths=2.4, linestyles=[LS[v]])
+    ax.plot(K["k"], K["RHf"], marker=MK[v], ms=9, color=COL[v], mfc="white", mew=2, zorder=5)
+handles = [Line2D([0], [0], color=COL[v], lw=2.4, ls=LS[v], marker=MK[v], mfc="white", mew=2, ms=8)
+           for v in VARIETIES]
+ax.legend(handles, VARIETIES, frameon=False, fontsize=13, loc="lower right",
+          bbox_to_anchor=(1.0, 0.13), handlelength=3.2)
+ax.text(0.98, 0.03, "95% joint confidence regions (SSE contours of the non-linear model)\n"
+        "Marker: estimate; non-overlapping regions differ",
+        transform=ax.transAxes, ha="right", va="bottom", fontsize=11.5, color="#444")
+ax.set_xlabel("Softening rate constant, k (min$^{-1}$)")
+ax.set_ylabel("Final relative hardness, RH$_f$ (–)")
+ax.set_xlim(0.022, 0.06)
+ax.set_ylim(0.19, 0.5)
+save(fig, "Fig 4.2 - joint confidence regions k RHf.png")
+
+# =============================================================================
+# 7. Fig 4.3 – cooked seeds + logistic model
+# =============================================================================
+fig, ax = plt.subplots(figsize=(11, 6.4))
+tt = np.linspace(0, 170, 400)
+ax.axhline(95, color="#888", ls=":", lw=1.3)
+ax.text(171, 95, "95%", va="center", fontsize=12, color="#666")
+for v in VARIETIES:
+    L = LOG[v]
+    ax.plot(tt, 100 / (1 + np.exp(-(L["a"] + L["b"] * tt))), color=COL[v], lw=2.6, ls=LS[v])
+    ax.scatter(L["t"], L["pct"], marker=MK[v], s=55, color=COL[v], edgecolor="white", lw=0.8, zorder=3)
+    ax.plot([L["CT95"]] * 2, [0, 95], color=COL[v], lw=1.2, ls=":", zorder=1)
+handles = [Line2D([0], [0], color=COL[v], lw=2.6, ls=LS[v], marker=MK[v], ms=8, mec="white") for v in VARIETIES]
+ax.legend(handles, [f'{v}  ({LOG[v]["CT95"]:.0f} min)' for v in VARIETIES], title="Variety (CT$_{95}$)",
+          title_fontsize=14, frameon=False, fontsize=13.5, loc="center left", bbox_to_anchor=(1.04, 0.5),
+          handlelength=3.2)
+ax.text(1.05, 0.12, "Points: % cooked seeds\n(n = 20 per time point)\nLines: logistic model\nDotted: CT$_{95}$",
+        transform=ax.transAxes, va="top", fontsize=12.5, color="#555")
+ax.set_xlabel("Cooking time at 95 °C (min)")
+ax.set_ylabel("Cooked seeds (%)")
+ax.set_xlim(0, 175)
+ax.set_ylim(-2, 104)
+save(fig, "Fig 4.3 - logistic curves cooked seeds.png")
+
+# =============================================================================
+# 8. Fig 4.4 – CT95 bars with 95% CI and letters
+# =============================================================================
+fig, ax = plt.subplots(figsize=(9, 5.8))
+for i, v in enumerate(VARIETIES):
+    L = LOG[v]
+    ax.bar(i, L["CT95"], 0.65, color=COL[v])
+    ax.errorbar(i, L["CT95"], yerr=[[L["CT95"] - L["lo"]], [L["hi"] - L["CT95"]]],
+                color="black", capsize=6, lw=1.6)
+    ax.text(i, L["hi"] + 3, LET[v], ha="center", fontsize=17, fontweight="bold")
+    ax.text(i, 8, f'{L["CT95"]:.1f}\nmin', ha="center", fontsize=13.5, color="white", fontweight="bold")
+ax.set_xticks(range(6))
+ax.set_xticklabels(VARIETIES, rotation=20, ha="right")
+for txt, v in zip(ax.get_xticklabels(), VARIETIES):
+    txt.set_color(COL[v])
+    txt.set_fontweight("bold")
+ax.set_ylabel("CT$_{95}$ (min)")
+ax.set_ylim(0, 135)
+ax.text(0.01, 0.98, "Error bars: 95% CI (Fieller). Different letters: pairwise z-tests,\n"
+        "Bonferroni-adjusted, p < 0.05", transform=ax.transAxes, va="top", fontsize=11.5, color="#444")
+save(fig, "Fig 4.4 - CT95 per variety.png")
+
+# =============================================================================
+# 9. Fig 4.5 – k vs CT95
+# =============================================================================
+x = np.array([KIN[v]["k"] for v in VARIETIES])
+y = np.array([LOG[v]["CT95"] for v in VARIETIES])
+reg = stats.linregress(x, y)
+r, p = stats.pearsonr(x, y)
+fig, ax = plt.subplots(figsize=(8.6, 6.2))
+xs = np.linspace(x.min(), x.max(), 200)
+ax.plot(xs, reg.intercept + reg.slope * xs, color="#555", lw=1.8, ls="--")
+label_pos = {"Kat Kunde": (0.0240, 52), "Kunde Soko": (0.0228, 90), "Katumani 80": (0.0420, 63),
+             "Kunde Tamu": (0.0298, 96), "Machakos 66": (0.0445, 72), "KVU-27-1": (0.0405, 113)}
+for v in VARIETIES:
+    K, L = KIN[v], LOG[v]
+    ax.errorbar(K["k"], L["CT95"], xerr=[[K["k"] - K["k_lo"]], [K["k_hi"] - K["k"]]],
+                yerr=[[L["CT95"] - L["lo"]], [L["hi"] - L["CT95"]]], fmt=MK[v], ms=11, color=COL[v],
+                mec="white", mew=1.2, capsize=3, lw=1.3, zorder=4)
+    ax.annotate(v, (K["k"], L["CT95"]), xytext=label_pos[v], ha="left", va="center", fontsize=13.5,
+                fontweight="bold", color=COL[v],
+                arrowprops=dict(arrowstyle="-", color=COL[v], lw=0.9, shrinkA=2, shrinkB=7))
+ax.text(0.97, 0.95, f"r = {r:.2f},  p = {p:.2f}  (n = 6)\nR$^2$ = {r ** 2:.2f};  "
+        + ("not significant" if p >= 0.05 else "significant"), transform=ax.transAxes, ha="right", va="top",
+        fontsize=14, bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="#BBBBBB"))
+ax.text(0.02, 0.03, "Variety means ± 95% CI", transform=ax.transAxes, fontsize=13, color="#555")
+ax.set_xlabel("Softening rate constant, k (min$^{-1}$)")
+ax.set_ylabel("Cooking time, CT$_{95}$ (min)")
+ax.set_xlim(0.022, 0.058)
+ax.set_ylim(40, 120)
+save(fig, "Fig 4.5 - k vs CT95.png")
+
+print(f"\nAll figures are in: {OUT.resolve()}")
