@@ -1,0 +1,253 @@
+"""
+Part 4.1 – Cooking behaviour of whole seeds (O1)
+================================================
+Thesis: Influence of inter-variety variability on cooking behaviour of cowpeas
+Author: Sam Sokneang (Jo Sam), KU Leuven, 2026
+
+This script makes all figures and tables of Section 4.1 from the SAS output.
+No model is refitted in Python: k, RHf, a, b, CT95 and their SE come from SAS.
+
+Input files (same folder as this script)
+  SAS PROC NLIN output (fractional conversion model, relative hardness of every seed):
+      RELATIVE_cooking_kinetics_output_soaked_cowpeas_oct_2026_1.xlsx
+  SAS PROC LOGISTIC output (cooked seeds, predicted values, CT95 and SE):
+      soaked_and_unsoaked_current_analysis-logistic_2.xlsx
+
+Output (folder "outputs_4_1")
+  Fig 4.1  Cooking curves: relative hardness vs time, model lines, legend = variety names
+  Fig 4.2  Joint 95% confidence regions of k and RHf
+  Fig 4.3  Logistic curves of cooked seeds, CT95 marked
+  Fig 4.4  k vs CT95
+  Table 4.1 Softening kinetic parameters (n, k ± SE, RHf ± SE, R²)
+  Table 4.2 Logistic model parameters (a, b, CT95 ± SE)
+  Checks printed in the console: overlap of confidence regions, CT95 pairwise z-tests,
+  correlation of k and RHf with CT95
+
+Requirements: Python 3.10+ (tested on 3.13; runs on 3.14), numpy, pandas, scipy,
+matplotlib, openpyxl – all included in Anaconda.
+"""
+
+from itertools import combinations
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import openpyxl
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from scipy import stats
+
+# =============================================================================
+# 0. Settings
+# =============================================================================
+SAS_NLIN_FILE = "RELATIVE_cooking_kinetics_output_soaked_cowpeas_oct_2026_1.xlsx"
+SAS_LOGISTIC_FILE = "soaked_and_unsoaked_current_analysis-logistic_2.xlsx"
+OUT = Path("outputs_4_1")
+OUT.mkdir(exist_ok=True)
+
+# Varieties in order of CT95 (shortest -> longest), used in every figure and table
+VARIETIES = ["Kat Kunde", "Kunde Soko", "Katumani 80", "Kunde Tamu", "Machakos 66", "KVU-27-1"]
+NLIN_SHEET = {"Kat Kunde": "Kat Kunde", "Kunde Soko": "Kunde Soko", "Katumani 80": "K80",
+              "Kunde Tamu": "Kunde Tamu", "Machakos 66": "Machakos66", "KVU-27-1": "KVU27"}
+
+COLOUR = dict(zip(VARIETIES, ["#1a4f8b", "#a8241c", "#1d6b37", "#b85000", "#5e2a84", "#b0306e"]))
+MARKER = dict(zip(VARIETIES, ["o", "s", "^", "D", "v", "P"]))
+LINE = {"Kat Kunde": (0, (6, 2)), "Kunde Soko": "-", "Katumani 80": "-",
+        "Kunde Tamu": (0, (1.5, 1.5)), "Machakos 66": "-", "KVU-27-1": (0, (6, 2))}
+
+plt.rcParams.update({
+    "font.family": "serif", "font.serif": ["Times New Roman", "Liberation Serif", "DejaVu Serif"],
+    "font.size": 14, "axes.linewidth": 1.2, "axes.spines.top": False, "axes.spines.right": False,
+    "axes.labelweight": "bold", "savefig.dpi": 300,
+})
+
+
+def save(fig, name):
+    fig.savefig(OUT / name, facecolor="white", bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+    print("saved:", name)
+
+
+def handles(marker=True):
+    return [Line2D([0], [0], color=COLOUR[v], lw=2.6, ls=LINE[v], marker=MARKER[v] if marker else None,
+                   mfc="white", mew=1.6, ms=7) for v in VARIETIES]
+
+
+def frac_conv(t, k, RHf):
+    """Fractional conversion model: RH(t) = RHf + (1 - RHf) exp(-k t)"""
+    return RHf + (1 - RHf) * np.exp(-k * t)
+
+
+# =============================================================================
+# 1. Read SAS PROC NLIN output: RH of every seed, k and RHf with SE
+# =============================================================================
+def read_sas_output_table(ws):
+    """The SAS output table (Obs, Time, RH, predRH, k, RHf) is not always in the
+    same columns, so search for its header row."""
+    rows = list(ws.iter_rows(values_only=True))
+    for r, row in enumerate(rows):
+        row = list(row)
+        for c in range(len(row) - 5):
+            if row[c] == "Obs" and row[c + 1] == "Time" and row[c + 2] == "RH" and row[c + 3] == "predRH":
+                df = pd.DataFrame([list(x[c:c + 6]) for x in rows[r + 1:]],
+                                  columns=["Obs", "Time", "RH", "predRH", "k", "RHf"])
+                return df.apply(pd.to_numeric, errors="coerce").dropna(subset=["Time", "RH"])
+    raise ValueError(f"SAS output table not found on sheet {ws.title}")
+
+
+wb = openpyxl.load_workbook(SAS_NLIN_FILE, read_only=True, data_only=True)
+RH = {v: read_sas_output_table(wb[NLIN_SHEET[v]]) for v in VARIETIES}
+
+kin = pd.read_excel(SAS_NLIN_FILE, sheet_name="Summary 6 var", header=1, usecols="B:F", nrows=6)
+kin.columns = ["variety", "k", "SE_k", "RHf", "SE_RHf"]
+kin = kin.set_index("variety").loc[VARIETIES]
+kin["n"] = [len(RH[v]) for v in VARIETIES]
+kin["R2"] = [1 - ((RH[v]["RH"] - RH[v]["predRH"]) ** 2).sum() / ((RH[v]["RH"] - RH[v]["RH"].mean()) ** 2).sum()
+             for v in VARIETIES]
+
+# =============================================================================
+# 2. Read SAS PROC LOGISTIC output: % cooked, predicted p, CT95 and SE
+# =============================================================================
+logi = pd.read_excel(SAS_LOGISTIC_FILE, sheet_name="Soaked cooking time")
+ct = pd.read_excel(SAS_LOGISTIC_FILE, sheet_name="CT95", header=None, skiprows=21, usecols="B:D", nrows=6)
+ct.columns = ["variety", "CT95", "SE_CT95"]
+ct = ct.set_index("variety").loc[VARIETIES]
+
+# SAS gives predicted p at each time point; logit(p) = a + b t is a straight line,
+# so a and b follow exactly from a linear fit of logit(p) on time.
+for v in VARIETIES:
+    g = logi[logi["var"] == v]
+    p = g["predicted"].clip(1e-9, 1 - 1e-9)
+    b, a = np.polyfit(g["Ctime"], np.log(p / (1 - p)), 1)
+    ct.loc[v, "a"], ct.loc[v, "b"] = a, b
+
+# =============================================================================
+# 3. Tables 4.1 and 4.2
+# =============================================================================
+table_41 = pd.DataFrame({
+    "Variety": VARIETIES,
+    "n": kin["n"].values,
+    "k ± SE (min-1)": [f"{k:.4f} ± {s:.4f}" for k, s in zip(kin["k"], kin["SE_k"])],
+    "RHf ± SE (-)": [f"{r:.3f} ± {s:.3f}" for r, s in zip(kin["RHf"], kin["SE_RHf"])],
+    "R2": [f"{r:.2f}" for r in kin["R2"]]})
+table_42 = pd.DataFrame({
+    "Variety": VARIETIES,
+    "a (-)": [f"{a:.3f}" for a in ct["a"]],
+    "b (min-1)": [f"{b:.4f}" for b in ct["b"]],
+    "CT95 ± SE (min)": [f"{c:.1f} ± {s:.1f}" for c, s in zip(ct["CT95"], ct["SE_CT95"])]})
+table_41.to_csv(OUT / "Table 4.1 - softening kinetic parameters.csv", index=False, encoding="utf-8-sig")
+table_42.to_csv(OUT / "Table 4.2 - logistic parameters and CT95.csv", index=False, encoding="utf-8-sig")
+print("\nTable 4.1\n", table_41.to_string(index=False))
+print("\nTable 4.2\n", table_42.to_string(index=False))
+
+# =============================================================================
+# 4. Fig 4.1 – cooking curves
+# =============================================================================
+fig, ax = plt.subplots(figsize=(10.5, 6.6))
+shift = dict(zip(VARIETIES, np.linspace(-2.5, 2.5, 6)))     # small shift so error bars do not overlap
+for v in VARIETIES:
+    m = RH[v].groupby("Time")["RH"].agg(["mean", "std"])
+    ax.errorbar(m.index + shift[v], m["mean"], yerr=m["std"], fmt=MARKER[v], ms=6.5, color=COLOUR[v],
+                mfc="white", mew=1.6, capsize=2.5, lw=1, zorder=3)
+    t = np.linspace(0, RH[v]["Time"].max(), 300)
+    ax.plot(t, frac_conv(t, kin.loc[v, "k"], kin.loc[v, "RHf"]), color=COLOUR[v], lw=2.6, ls=LINE[v], zorder=4)
+ax.legend(handles(), VARIETIES, frameon=False, fontsize=13, loc="upper right", handlelength=3.4)
+ax.set_xlabel("Cooking time at 95 °C (min)")
+ax.set_ylabel("Relative hardness, H/H$_0$ (–)")
+ax.set_xlim(-5, 172)
+ax.set_ylim(0, 1.2)
+save(fig, "Fig 4.1 - cooking curves.png")
+
+# =============================================================================
+# 5. Fig 4.2 – joint 95% confidence regions of k and RHf
+#    Region = all (k, RHf) with SSE <= SSE_min * (1 + p/(n-p) * F(0.95; p, n-p)), p = 2
+# =============================================================================
+K = np.linspace(0.020, 0.062, 400)
+R = np.linspace(0.18, 0.50, 400)
+KK, RR = np.meshgrid(K, R)
+region = {}
+fig, ax = plt.subplots(figsize=(9, 6.6))
+ax.grid(True, color="#E9E9E9", lw=0.8)
+ax.set_axisbelow(True)
+for v in VARIETIES:
+    t, y, n = RH[v]["Time"].to_numpy(), RH[v]["RH"].to_numpy(), len(RH[v])
+    sse_min = np.sum((y - frac_conv(t, kin.loc[v, "k"], kin.loc[v, "RHf"])) ** 2)
+    limit = sse_min * (1 + 2 / (n - 2) * stats.f.ppf(0.95, 2, n - 2))
+    SSE = ((y[None, None, :] - frac_conv(t[None, None, :], KK[..., None], RR[..., None])) ** 2).sum(-1)
+    region[v] = SSE <= limit
+    ax.contourf(KK, RR, SSE, levels=[0, limit], colors=[COLOUR[v]], alpha=0.12)
+    ax.contour(KK, RR, SSE, levels=[limit], colors=[COLOUR[v]], linewidths=2.4, linestyles=[LINE[v]])
+    ax.plot(kin.loc[v, "k"], kin.loc[v, "RHf"], marker=MARKER[v], ms=9, color=COLOUR[v], mfc="white", mew=2, zorder=5)
+ax.legend(handles(), VARIETIES, frameon=False, fontsize=13, loc="lower right", handlelength=3.2)
+ax.set_xlabel("Softening rate constant, k (min$^{-1}$)")
+ax.set_ylabel("Final relative hardness, RH$_f$ (–)")
+ax.set_xlim(0.022, 0.06)
+ax.set_ylim(0.19, 0.5)
+save(fig, "Fig 4.2 - joint confidence regions k RHf.png")
+
+overlap = [f"{a} – {b}" for a, b in combinations(VARIETIES, 2) if (region[a] & region[b]).any()]
+print(f"\nConfidence regions overlapping: {len(overlap)} of 15 pairs -> {overlap}")
+
+# =============================================================================
+# 6. Fig 4.3 – logistic curves of cooked seeds, CT95 marked
+# =============================================================================
+fig, ax = plt.subplots(figsize=(11, 6.4))
+t = np.linspace(0, 170, 400)
+ax.axhline(95, color="#888", ls=":", lw=1.3)
+ax.text(171, 95, "95%", va="center", fontsize=12, color="#666")
+for v in VARIETIES:
+    g = logi[logi["var"] == v]
+    a, b = ct.loc[v, "a"], ct.loc[v, "b"]
+    ax.plot(t, 100 / (1 + np.exp(-(a + b * t))), color=COLOUR[v], lw=2.6, ls=LINE[v])
+    ax.scatter(g["Ctime"], g["Cookpercent"], marker=MARKER[v], s=55, color=COLOUR[v], edgecolor="white",
+               lw=0.8, zorder=3)
+    ax.plot([ct.loc[v, "CT95"]] * 2, [0, 95], color=COLOUR[v], lw=1.2, ls=":", zorder=1)
+ax.legend(handles(), [f'{v}  (CT$_{{95}}$ = {ct.loc[v, "CT95"]:.0f} min)' for v in VARIETIES],
+          frameon=False, fontsize=13, loc="center left", bbox_to_anchor=(1.03, 0.5), handlelength=3.2)
+ax.set_xlabel("Cooking time at 95 °C (min)")
+ax.set_ylabel("Cooked seeds (%)")
+ax.set_xlim(0, 175)
+ax.set_ylim(-2, 104)
+save(fig, "Fig 4.3 - logistic curves cooked seeds.png")
+
+# CT95 pairwise z-tests with the SAS standard errors
+z = {(a, b): abs(ct.loc[a, "CT95"] - ct.loc[b, "CT95"]) / np.hypot(ct.loc[a, "SE_CT95"], ct.loc[b, "SE_CT95"])
+     for a, b in combinations(VARIETIES, 2)}
+(a_max, b_max), z_max = max(z.items(), key=lambda kv: kv[1])
+print(f"CT95: largest pairwise difference {a_max} vs {b_max}, z = {z_max:.2f}, "
+      f"p = {2 * stats.norm.sf(z_max):.3f} (no pair significant if p > 0.05)")
+
+# =============================================================================
+# 7. Fig 4.4 – k vs CT95
+# =============================================================================
+r, p = stats.pearsonr(kin["k"], ct["CT95"])
+r_rhf, p_rhf = stats.pearsonr(kin["RHf"], ct["CT95"])
+print(f"k vs CT95: r = {r:.2f}, p = {p:.2f};  RHf vs CT95: r = {r_rhf:.2f}, p = {p_rhf:.2f}")
+
+fig, ax = plt.subplots(figsize=(8.6, 6.2))
+# Correlation (least-squares regression) line through the six variety means
+reg = stats.linregress(kin["k"], ct["CT95"])
+k_line = np.linspace(kin["k"].min() - 0.002, kin["k"].max() + 0.002, 100)
+ax.plot(k_line, reg.intercept + reg.slope * k_line, color="#555555", lw=1.8, ls="--", zorder=2,
+        label=f"CT$_{{95}}$ = {reg.intercept:.1f} + {reg.slope:.0f}·k")
+print(f"Regression line: CT95 = {reg.intercept:.1f} + {reg.slope:.1f} * k  (R² = {reg.rvalue ** 2:.2f})")
+label_pos ={"Kat Kunde": (0.0235, 50), "Kunde Soko": (0.0225, 92), "Katumani 80": (0.0425, 62),
+             "Kunde Tamu": (0.0300, 100), "Machakos 66": (0.0503, 76), "KVU-27-1": (0.0410, 118)}
+for v in VARIETIES:
+    ax.errorbar(kin.loc[v, "k"], ct.loc[v, "CT95"], xerr=kin.loc[v, "SE_k"], yerr=ct.loc[v, "SE_CT95"],
+                fmt=MARKER[v], ms=11, color=COLOUR[v], mec="white", mew=1.2, capsize=3, lw=1.3, zorder=4)
+    ax.annotate(v, (kin.loc[v, "k"], ct.loc[v, "CT95"]), xytext=label_pos[v], ha="left", va="center",
+                fontsize=13.5, fontweight="bold", color=COLOUR[v],
+                arrowprops=dict(arrowstyle="-", color=COLOUR[v], lw=0.9, shrinkA=2, shrinkB=7))
+ax.text(0.97, 0.05, f"r = {r:.2f}, R$^2$ = {r ** 2:.2f}, p = {p:.2f} (n = 6)", transform=ax.transAxes,
+        ha="right", fontsize=14, bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="#BBBBBB"))
+ax.legend(loc="upper right", frameon=False, fontsize=12.5)
+ax.text(0.02, 0.97, "Means ± SE (SAS)", transform=ax.transAxes, va="top", fontsize=12.5, color="#555")
+ax.set_xlabel("Softening rate constant, k (min$^{-1}$)")
+ax.set_ylabel("Cooking time, CT$_{95}$ (min)")
+ax.set_xlim(0.021, 0.058)
+ax.set_ylim(40, 128)
+save(fig, "Fig 4.4 - k vs CT95.png")
+
+print(f"\nAll outputs are in: {OUT.resolve()}")
